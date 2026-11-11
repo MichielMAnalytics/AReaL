@@ -7,7 +7,6 @@ from pathlib import Path
 
 from datasets import Dataset
 
-from areal import PPOTrainer
 from areal.api.cli_args import GRPOConfig, load_expr_config
 
 
@@ -67,6 +66,10 @@ def load_manifest(path: str, data_root: str) -> Dataset:
 
 
 def main(args: list[str]):
+    # Inference workers import this module to reconstruct PixelReasonerConfig.
+    # Trainer-only dependencies belong to the controller environment.
+    from areal import PPOTrainer
+
     config, _ = load_expr_config(args, PixelReasonerConfig)
     if config.rollout.backend.split(":", 1)[0] != "sglang":
         raise ValueError("The Pixel training example requires the SGLang backend")
