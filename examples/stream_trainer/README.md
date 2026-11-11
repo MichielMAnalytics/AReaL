@@ -50,13 +50,23 @@ The default is DP2 × TP1. For DP2 × TP2, explicitly set `NPROC_PER_NODE=4` and
 actual `MegatronPPOActor`, PPO objective and Megatron forward/backward schedule:
 
 1. Warm up one real update so the Adam moments are nonempty.
-1. Save model weights, FP32 master parameters, Adam state and scheduler state.
-1. Run one ordinary synchronous update and retain its post-reduction, pre-clipping
-   gradients and resulting state.
-1. Restore and check the identical initial state, then delay the last DP replica and
-   accumulate complete groups separately, with unequal chunks/token counts.
-1. Finish once all replicas arrive and compare gradients, updated weights, optimizer
-   state and scheduler state against the synchronous result.
+1. Save model weights, optimizer metadata and scheduler state on every rank. Gather FP32
+   master parameters and Adam moments to DP zero for each TP shard using MCore's public
+   `get_parameter_state_dp_zero()` API; complete optimizer tensors remain on those
+   roots.
+1. Run one ordinary synchronous update and retain its post-reduction, pre-clipping owned
+   gradient shards and resulting state. The BF16 probe uses public `prepare_grads()` to
+   expose valid post-reduce-scatter optimizer gradients before clipping; it then runs
+   the ordinary engine optimizer step. There is no dynamic gradient scaler, so the
+   repeated preparation only repeats the same copy/view.
+1. Restore optimizer metadata, then scatter master parameters and Adam moments with
+   public `load_parameter_state_from_dp_zero()`. All DP ranks participate in both state
+   collectives, including ranks that retain no full optimizer tensors. Check the
+   identical initial state, then delay the last DP replica and accumulate complete
+   groups separately, with unequal chunks/token counts.
+1. Finish once all replicas arrive and compare local owned gradient shards, updated
+   model weights, optimizer metadata and scheduler state on every rank. DP roots also
+   compare all FP32 master parameters and Adam moments against the synchronous result.
 
 It also requires a nonzero reference gradient and verifies that an early replica
 finishes backward before the artificial delay expires. Increase
@@ -69,13 +79,20 @@ packing/accumulation-order differences. They are configurable arguments to the s
 script and must be assessed against the chosen model's baseline numerical variance. This
 comparison does not establish bitwise equivalence or RL quality.
 
-This minimal test deliberately uses Megatron's **non-distributed Adam** optimizer, whose
-public state dictionary includes moments and FP32 master parameters. It instantiates the
-real AWEX adapter/residency without publishing metadata to an inference service. It does
-not validate AWEX transfers, offload races, or Megatron distributed-optimizer state
-parity. The E2E path below covers actual SGLang/AWEX orchestration and can retain the
-distributed optimizer, but its stochastic rollout outputs do not constitute an
-optimizer-state parity test.
+This minimal test uses Megatron's real **distributed Adam** optimizer. Its ordinary
+`state_dict()` contains metadata but omits the sharded master parameters and moments;
+the separate public DP-zero APIs are required for a complete snapshot and restore. The
+test requires nonzero `exp_avg` and `exp_avg_sq`, FP32 optimizer tensors, a nonzero
+reference gradient and an actual change to FP32 master parameters. It checks the
+restored snapshot exactly before comparing updates with the stated BF16 tolerances.
+Non-owned regions of a model's full `main_grad` buffer are deliberately excluded after
+reduce-scatter because they are not valid global gradients.
+
+It instantiates the real AWEX adapter/residency without publishing metadata to an
+inference service. It does not validate AWEX transfers or offload races. The E2E path
+below covers actual SGLang/AWEX orchestration, but its stochastic rollout outputs do not
+constitute an optimizer-state parity test. No optimizer method or production checkpoint
+assertion is patched or bypassed.
 
 ## Real colocated SGLang/AWEX E2E
 

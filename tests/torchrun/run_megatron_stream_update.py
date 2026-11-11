@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU-only comparison of real Megatron PPO updates; see examples/stream_trainer.
 
-This intentionally uses the non-distributed Adam optimizer so its public
-state_dict includes moments and FP32 master parameters. The E2E recipe also
-exercises the normal distributed optimizer. No optimizer method is patched.
+This uses the real distributed Adam optimizer. Public DP-zero gather/scatter
+APIs preserve FP32 masters and Adam moments, which state_dict alone omits.
+Only DP roots retain complete optimizer tensors. No optimizer method is patched.
 """
 
 import argparse
@@ -17,6 +17,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 
 from areal.api import FinetuneSpec
 from areal.api.alloc_mode import ModelAllocation
@@ -28,34 +29,89 @@ from areal.api.cli_args import (
     PPOActorConfig,
 )
 from areal.engine.megatron_engine import MegatronPPOActor
+from areal.engine.megatron_utils.optimizer_chain import iter_megatron_optimizer_leaves
 from areal.utils.data import tensor_container_to
 
 
 class UpdateProbe(MegatronPPOActor):
     """Observe real post-reduction, pre-clipping gradients at the step boundary."""
 
+    def distributed_optimizers(self) -> list[DistributedOptimizer]:
+        optimizers = list(iter_megatron_optimizer_leaves(self.optimizer))
+        if not optimizers or not all(
+            isinstance(optimizer, DistributedOptimizer) for optimizer in optimizers
+        ):
+            raise AssertionError(
+                "Numerical parity requires real distributed optimizer leaves"
+            )
+        return optimizers
+
     def optimizer_step(self) -> dict[str, float]:
-        self.observed_gradients = {
-            f"{index}.{name}": parameter.main_grad.detach().cpu().clone()
-            for index, chunk in enumerate(self.model)
-            for name, parameter in chunk.named_parameters()
-            if parameter.requires_grad and hasattr(parameter, "main_grad")
-        }
+        optimizers = self.distributed_optimizers()
+        if any(optimizer.grad_scaler is not None for optimizer in optimizers):
+            raise AssertionError("This BF16 probe requires no dynamic gradient scaler")
+        # After reduce-scatter, non-owned regions of model.main_grad are not
+        # global gradients. Public prepare_grads exposes only the valid owned
+        # shards on optimizer parameters. With BF16/no scaler this is an
+        # idempotent copy/view operation: the ordinary step prepares them again.
+        if self.optimizer.prepare_grads():
+            raise AssertionError("Unexpected nonfinite gradients before comparison")
+        self.observed_gradients = {}
+        for optimizer_index, optimizer in enumerate(optimizers):
+            for parameter_index, parameter in enumerate(optimizer.get_parameters()):
+                gradient = getattr(parameter, "decoupled_grad", None)
+                if gradient is None:
+                    gradient = parameter.grad
+                if gradient is not None:
+                    self.observed_gradients[f"{optimizer_index}.{parameter_index}"] = (
+                        gradient.detach().cpu().clone()
+                    )
         return super().optimizer_step()
 
     def snapshot(self) -> dict[str, Any]:
-        # Stage before cloning: duplicating Adam/model tensors on the GPU
-        # would make a small validation model require nearly twice the memory.
-        return copy.deepcopy(
-            tensor_container_to(
-                {
-                    "model": [chunk.state_dict() for chunk in self.model],
-                    "optimizer": self.optimizer.state_dict(),
-                    "scheduler": self.lr_scheduler.state_dict(),
-                },
-                "cpu",
+        # Every DP rank participates, but complete master/moment buffers stay
+        # only on DP zero for each TP shard. Do not broadcast or deepcopy these
+        # already-independent CPU gather buffers onto the other DP ranks.
+        parameter_states = [
+            optimizer.get_parameter_state_dp_zero()
+            for optimizer in self.distributed_optimizers()
+        ]
+        return {
+            "model": copy.deepcopy(
+                tensor_container_to([chunk.state_dict() for chunk in self.model], "cpu")
             ),
-        )
+            "optimizer": copy.deepcopy(
+                tensor_container_to(self.optimizer.state_dict(), "cpu")
+            ),
+            "optimizer_parameters": parameter_states,
+            "scheduler": copy.deepcopy(self.lr_scheduler.state_dict()),
+        }
+
+    def assert_parameter_state_complete(self, state: dict[str, Any]) -> None:
+        for optimizer, parameter_state in zip(
+            self.distributed_optimizers(), state["optimizer_parameters"], strict=True
+        ):
+            is_root = dist.get_rank(optimizer.data_parallel_group_gloo) == 0
+            if not is_root:
+                assert parameter_state is None, (
+                    "Full optimizer tensors must remain on DP zero"
+                )
+                continue
+            assert parameter_state is not None, (
+                "DP zero must own complete optimizer state"
+            )
+            for field in ("param", "exp_avg", "exp_avg_sq"):
+                tensors = [
+                    value
+                    for name, value in self.tensor_items(parameter_state)
+                    if name.endswith(f"/{field}")
+                ]
+                assert tensors and any(
+                    torch.count_nonzero(value) for value in tensors
+                ), f"DP-zero snapshot must contain nonzero {field} tensors"
+                assert all(value.dtype == torch.float32 for value in tensors), (
+                    f"DP-zero {field} tensors must preserve FP32 optimizer precision"
+                )
 
     def tensor_items(self, value: Any, path: str = ""):
         if isinstance(value, torch.Tensor):
@@ -71,6 +127,17 @@ class UpdateProbe(MegatronPPOActor):
         for chunk, chunk_state in zip(self.model, state["model"], strict=True):
             chunk.load_state_dict(chunk_state)
         self.optimizer.load_state_dict(copy.deepcopy(state["optimizer"]))
+        for optimizer, parameter_state in zip(
+            self.distributed_optimizers(), state["optimizer_parameters"], strict=True
+        ):
+            # All ranks call scatter; only DP zero supplies the full tensors.
+            # FP8 format conversion can mutate the input checkpoint dictionary;
+            # this BF16-only test intentionally excludes that conversion.
+            if optimizer.ddp_config.fp8_param_gather:
+                raise AssertionError(
+                    "Numerical parity fixture requires BF16 parameter gather"
+                )
+            optimizer.load_parameter_state_from_dp_zero(parameter_state)
         self.lr_scheduler.load_state_dict(copy.deepcopy(state["scheduler"]))
         self.optimizer_zero_grad()
 
@@ -149,7 +216,7 @@ def main() -> None:
         megatron=MegatronEngineConfig(
             bridge_type=args.bridge_type,
             ddp=DistributedDataParallelConfig(
-                use_distributed_optimizer=False,
+                use_distributed_optimizer=True,
                 overlap_grad_reduce=False,
                 overlap_param_gather=False,
             ),
@@ -171,16 +238,21 @@ def main() -> None:
         group["logprobs"] = torch.roll(logp.detach().cpu(), shifts=1, dims=-1)
     actor.serial_update(raw)  # Populate Adam moments before either compared update.
     initial = actor.snapshot()
-    moments = [
-        value
-        for name, value in actor.tensor_items(initial["optimizer"])
-        if name.endswith("/exp_avg")
-    ]
-    assert moments and any(torch.count_nonzero(value) for value in moments), (
-        "Optimizer snapshot must contain nonzero Adam moments, not just param groups"
-    )
+    actor.assert_parameter_state_complete(initial)
     actor.serial_update(raw)
     reference = actor.snapshot()
+    actor.assert_parameter_state_complete(reference)
+    for initial_parameters, reference_parameters in zip(
+        initial["optimizer_parameters"], reference["optimizer_parameters"], strict=True
+    ):
+        if initial_parameters is not None:
+            before = dict(actor.tensor_items(initial_parameters))
+            after = dict(actor.tensor_items(reference_parameters))
+            assert any(
+                not torch.equal(value, after[name])
+                for name, value in before.items()
+                if name.endswith("/param")
+            ), "Reference update must change FP32 master parameters"
     gradients = copy.deepcopy(actor.observed_gradients)
     assert gradients and any(torch.count_nonzero(value) for value in gradients.values())
     actor.restore(initial)
@@ -211,12 +283,14 @@ def main() -> None:
         "backward_done_s": backward_done,
         "rtol": args.rtol,
         "atol": args.atol,
-        "optimizer": "non-distributed Adam; nonempty moments",
+        "optimizer": "distributed Adam; DP-zero FP32 masters and nonempty moments",
+        "optimizer_parameter_state_owner": "DP zero of each optimizer/TP shard",
         "checks": [
             "same initial model/optimizer/scheduler",
-            "pre-step gradients",
+            "owned pre-clipping gradient shards",
             "updated model",
-            "optimizer state",
+            "optimizer metadata on all ranks",
+            "DP-zero FP32 master parameters and Adam moments",
             "scheduler state",
         ],
     }
