@@ -927,6 +927,9 @@ class RemoteSGLangEngine(InferenceEngine):
     def launch_server(self, server_args: dict[str, Any]) -> LocalInfServerInfo:
         return self._engine.launch_server(server_args)
 
+    def get_stream_topology(self) -> dict[str, Any]:
+        return self._engine.get_stream_topology()
+
     def teardown_server(self):
         return self._engine.teardown_server()
 
