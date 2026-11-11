@@ -4643,7 +4643,9 @@ class PPOConfig(BaseExperimentConfig):
             "KL rewards require an unsupported reference model": actor.kl_ctl == 0,
             "dynamic_bs must be false": not self.dynamic_bs,
             "deterministic_sampling is unsupported": not self.rollout.deterministic_sampling,
-            "PRM advantage shaping is unsupported": not self.rollout.agent.prm.enabled,
+            "PRM advantage shaping is unsupported": not (
+                self.rollout.agent.prm.enabled and self.rollout.agent.prm.scorers
+            ),
             "max_head_offpolicyness must equal zero": self.rollout.max_head_offpolicyness
             == 0,
             "consumer_batch_size must match train_dataset.batch_size": (

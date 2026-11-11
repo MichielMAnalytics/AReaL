@@ -11,6 +11,7 @@ from areal.api.cli_args import (
     NormConfig,
     PPOActorConfig,
     PPOConfig,
+    PRMScorerConfig,
     SchedulingSpec,
     SchedulingStrategy,
     StreamTrainerConfig,
@@ -79,6 +80,13 @@ def test_stream_trainer_config_fp8_training_rejected():
     config = _stream_config()
     config.actor.megatron.fp8_config = FP8EngineConfig()
     with pytest.raises(ValueError, match="FP8 training is unsupported"):
+        config.__post_init__()
+
+
+def test_stream_trainer_config_enabled_prm_scorer_rejected():
+    config = _stream_config()
+    config.rollout.agent.prm.scorers.append(PRMScorerConfig())
+    with pytest.raises(ValueError, match="PRM advantage shaping is unsupported"):
         config.__post_init__()
 
 
