@@ -91,12 +91,9 @@ def _tensor_diagnostics(
         "observed_dtype": str(observed.dtype),
     }
     report["strict_pass"] = True
-    if initial is None:
-        try:
-            torch.testing.assert_close(reference, observed, rtol=rtol, atol=atol)
-        except AssertionError as error:
-            report.update(strict_pass=False, strict_error=str(error)[:2000])
-    elif initial.shape != reference.shape or initial.dtype != reference.dtype:
+    if initial is not None and (
+        initial.shape != reference.shape or initial.dtype != reference.dtype
+    ):
         return {
             **report,
             "strict_pass": False,
@@ -122,6 +119,9 @@ def _tensor_diagnostics(
             origin = initial_flat[start : start + (1 << 20)]
             xchunk = xchunk - origin
             ychunk = ychunk - origin
+        # Preserve the original pointwise tolerance while bounding assertion
+        # temporaries for optimizer buffers spanning an entire TP shard.
+        if report["strict_pass"]:
             try:
                 torch.testing.assert_close(xchunk, ychunk, rtol=rtol, atol=atol)
             except AssertionError as error:
