@@ -64,7 +64,7 @@ class StreamTrainer:
                 raise RuntimeError(
                     "Actor ranks disagree about their complete TP replica"
                 )
-            if sum(self.actor.workers_is_dp_head[rank] for rank in ranks) != 1:
+            if sum(bool(self.actor.workers_is_dp_head[rank]) for rank in ranks) != 1:
                 raise RuntimeError("A streamed actor replica must have one DP head")
             gpus = frozenset(
                 self._gpu_key(member["host"], member["gpu_uuid"]) for member in members

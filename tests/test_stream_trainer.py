@@ -226,3 +226,32 @@ def test_stream_trainer_release_requires_commit_before_reopening_rollout(monkeyp
     assert len(actor.commits) == 1
     assert rollout.restores == 1
     assert not rollout.closed
+
+
+def test_stream_topology_nonhead_rpc_none_preserves_complete_tp_mapping():
+    """The training RPC guard returns None for non-DP-head queries."""
+    actor = SimpleNamespace(
+        workers_is_dp_head=[True, None, True, None],
+        stream_topology=lambda: [
+            dict(
+                rank=rank,
+                dp_rank=rank // 2,
+                replica_ranks=[rank // 2 * 2, rank // 2 * 2 + 1],
+                host="node",
+                gpu_uuid=f"GPU-{rank}",
+            )
+            for rank in range(4)
+        ],
+    )
+    rollout = SimpleNamespace(
+        workers=[SimpleNamespace(ip="node"), SimpleNamespace(ip="node")],
+        stream_topology=lambda: [
+            dict(worker_rank=0, gpu_uuids=["GPU-2", "GPU-3"]),
+            dict(worker_rank=1, gpu_uuids=["GPU-0", "GPU-1"]),
+        ],
+    )
+    trainer = StreamTrainer(actor, rollout, StreamTrainerConfig(enabled=True))
+
+    trainer._discover_replicas()
+
+    assert trainer._replicas == {0: (1, [2, 3]), 1: (0, [0, 1])}
