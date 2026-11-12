@@ -130,6 +130,53 @@ thresholds, enable a different model/DDP normalization path, or change the produ
 engine. **A passing control does not establish that the default legacy fixture or
 arbitrary production packing/normalization passes numerical parity.**
 
+An additional optional **independent serial numerator reference B** separates legacy
+BF16 loss scaling from streamed scheduling:
+
+```bash
+FILEROOT='<separate independent-reference output directory>' \
+  bash examples/stream_trainer/run_minimal_gpu.sh --serial-numerator-reference
+```
+
+Without this option, reference **A** remains the ordinary synchronous PPO update and is
+labeled `A_original_serial`. With the option, warmup and the initial snapshot stay
+unchanged, but the compared serial update uses a test subclass's two hooks: the normal
+`train_batch()` still constructs microbatches and computes the true global denominator
+`M`; its loss callback substitutes denominator 1 and divides its original `DP*Nmb`
+multiplier by DP. MCore's normal `/Nmb` then leaves a raw token numerator backward.
+Immediately before the ordinary serial gradient finalization, the test scales FP32 main
+gradients by `DP/M`; the normal DP average and real optimizer step remain intact. This
+reference invokes neither `stream_accumulate()` nor `stream_backward_batch()` to
+construct its gradients. It only supports the legacy `calculate_per_token_loss=False`
+path and does not change that model/DDP setting.
+
+B is labeled `B_serial_numerator`, adds `-serial-numerator-reference` to the fixture
+label and sets `original_A_pass_claimed: false`. Its actual global mass, callback count,
+FP32 scale and single-finalization count are recorded. It can be combined with the
+explicit power-of-two control, still using a separate output directory. **Passing
+B-versus-stream does not change a failed A-versus-stream result into a pass and does not
+establish parity with the original legacy production normalization.**
+
+Every run now records the ordered microbatches passed to the real forward/backward
+schedule and actual loss callbacks. SHA-256 fingerprints include tensor dtype, shape and
+bytes for input IDs, sequence boundaries, masks, advantages and behavior/proximal
+logprobs when present. Both original and source padded model inputs are recorded,
+alongside padding metadata, native-normalization flags and per-sequence semantic hashes
+that exclude unrelated padded rows. Transport dummy microbatches remain visible but are
+excluded from real-sequence order comparisons. These are inputs at the engine's schedule
+boundary; they do not claim to fingerprint intermediates inside model kernels. For B, a
+pass additionally requires matching real forward/backward padded inputs and semantic
+sequence order, including the loss inputs. Mismatching hashes are reported; they must
+not be described as a pure normalization-placement experiment.
+
+DP roots also report `master_update_delta`: chunked comparisons of
+`serial_master - initial_master` against `stream_master - initial_master`, including
+aggregate relative L2 and cosine. This avoids a small update difference being obscured
+by the absolute parameter magnitude. It is labeled `diagnostic_only`, uses the same
+stated tolerances for its descriptive mismatch fields, and does not alter the strict
+acceptance decision. Delta tensors are computed one bounded chunk at a time, without
+keeping additional complete model snapshots resident.
+
 This minimal test uses Megatron's real **distributed Adam** optimizer. Its ordinary
 `state_dict()` contains metadata but omits the sharded master parameters and moments;
 the separate public DP-zero APIs are required for a complete snapshot and restore. The

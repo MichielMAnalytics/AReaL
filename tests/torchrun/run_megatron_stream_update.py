@@ -8,6 +8,7 @@ Only DP roots retain complete optimizer tensors. No optimizer method is patched.
 
 import argparse
 import copy
+import hashlib
 import json
 import math
 import os
@@ -19,6 +20,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.utils import get_model_config
 
 from areal.api import FinetuneSpec
 from areal.api.alloc_mode import ModelAllocation
@@ -31,7 +33,7 @@ from areal.api.cli_args import (
 )
 from areal.engine.megatron_engine import MegatronPPOActor
 from areal.engine.megatron_utils.optimizer_chain import iter_megatron_optimizer_leaves
-from areal.utils.data import tensor_container_to
+from areal.utils.data import TRANSPORT_DUMMY_KEY, tensor_container_to
 
 _SUM_FIELDS = (
     "reference_squared_norm",
@@ -76,7 +78,11 @@ def _derived_metrics(sums: dict[str, float | int]) -> dict[str, float | None]:
 
 
 def _tensor_diagnostics(
-    reference: torch.Tensor, observed: torch.Tensor, rtol: float, atol: float
+    reference: torch.Tensor,
+    observed: torch.Tensor,
+    rtol: float,
+    atol: float,
+    initial: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     report: dict[str, Any] = {
         "reference_shape": list(reference.shape),
@@ -84,22 +90,45 @@ def _tensor_diagnostics(
         "reference_dtype": str(reference.dtype),
         "observed_dtype": str(observed.dtype),
     }
-    try:
-        torch.testing.assert_close(reference, observed, rtol=rtol, atol=atol)
-        report["strict_pass"] = True
-    except AssertionError as error:
-        report.update(strict_pass=False, strict_error=str(error)[:2000])
-    if reference.shape != observed.shape:
-        return report
+    report["strict_pass"] = True
+    if initial is None:
+        try:
+            torch.testing.assert_close(reference, observed, rtol=rtol, atol=atol)
+        except AssertionError as error:
+            report.update(strict_pass=False, strict_error=str(error)[:2000])
+    elif initial.shape != reference.shape or initial.dtype != reference.dtype:
+        return {
+            **report,
+            "strict_pass": False,
+            "strict_error": "Initial master shape/dtype differs",
+        }
+    if reference.shape != observed.shape or reference.dtype != observed.dtype:
+        return {
+            **report,
+            "strict_pass": False,
+            "strict_error": "Compared tensor shape/dtype differs",
+        }
     sums: dict[str, float | int] = {name: 0 for name in _SUM_FIELDS}
     maximum = 0.0
     xflat = reference.detach().cpu().reshape(-1)
     yflat = observed.detach().cpu().reshape(-1)
+    initial_flat = initial.detach().cpu().reshape(-1) if initial is not None else None
     # FP64 sufficient statistics can be summed across ranks. Bound transient CPU
     # memory rather than materializing several FP64 copies of a full model shard.
     for start in range(0, xflat.numel(), 1 << 20):
-        x = xflat[start : start + (1 << 20)].double()
-        y = yflat[start : start + (1 << 20)].double()
+        xchunk = xflat[start : start + (1 << 20)]
+        ychunk = yflat[start : start + (1 << 20)]
+        if initial_flat is not None:
+            origin = initial_flat[start : start + (1 << 20)]
+            xchunk = xchunk - origin
+            ychunk = ychunk - origin
+            try:
+                torch.testing.assert_close(xchunk, ychunk, rtol=rtol, atol=atol)
+            except AssertionError as error:
+                report.update(strict_pass=False)
+                report.setdefault("strict_error", str(error)[:2000])
+        x = xchunk.double()
+        y = ychunk.double()
         difference = y - x
         sums["reference_squared_norm"] += x.square().sum().item()
         sums["observed_squared_norm"] += y.square().sum().item()
@@ -141,6 +170,12 @@ def comparison_diagnostics(
             errors.append(f"{path}: scalar value or type differs")
 
     compare(reference, observed, "")
+    return _summarize_tensor_diagnostics(tensors, errors)
+
+
+def _summarize_tensor_diagnostics(
+    tensors: dict[str, Any], errors: list[str]
+) -> dict[str, Any]:
     sums = {name: 0 for name in _SUM_FIELDS}
     for tensor in tensors.values():
         for name, value in tensor.get("sums", {}).items():
@@ -158,6 +193,37 @@ def comparison_diagnostics(
             **_derived_metrics(sums),
         },
     }
+
+
+def master_delta_diagnostics(
+    actor: "UpdateProbe",
+    initial: Any,
+    reference: Any,
+    observed: Any,
+    rtol: float,
+    atol: float,
+) -> dict[str, Any]:
+    initial_tensors = dict(actor.tensor_items(initial))
+    reference_tensors = dict(actor.tensor_items(reference))
+    observed_tensors = dict(actor.tensor_items(observed))
+    tensors = {}
+    errors = []
+    for path, origin in initial_tensors.items():
+        if not path.endswith("/param"):
+            continue
+        if path not in reference_tensors or path not in observed_tensors:
+            errors.append(f"{path}: missing updated master tensor")
+            continue
+        tensors[path] = _tensor_diagnostics(
+            reference_tensors[path], observed_tensors[path], rtol, atol, initial=origin
+        )
+    report = _summarize_tensor_diagnostics(tensors, errors)
+    report.update(
+        diagnostic_only=True,
+        has_local_master_state=bool(tensors),
+        comparison_direction="reference=serial_master-initial_master; observed=stream_master-initial_master",
+    )
+    return report
 
 
 def _json_safe(value: Any) -> Any:
@@ -178,8 +244,283 @@ def write_report(path: Path, report: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+_FINGERPRINT_KEYS = (
+    "input_ids",
+    "cu_seqlens",
+    "attention_mask",
+    "loss_mask",
+    "advantages",
+    "logprobs",
+    "prox_logp",
+)
+
+
+def _scalar_value(value: Any) -> float | None:
+    if torch.is_tensor(value) and value.ndim == 0:
+        return float(value.detach().cpu().item())
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def input_fingerprint(inputs: Mapping[str, Any]) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    for key in _FINGERPRINT_KEYS:
+        value = inputs.get(key)
+        if torch.is_tensor(value):
+            tensor = value.detach().cpu().contiguous()
+            fields[key] = {
+                "shape": list(tensor.shape),
+                "dtype": str(tensor.dtype),
+                "sha256": hashlib.sha256(
+                    tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
+                ).hexdigest(),
+            }
+        else:
+            fields[key] = {"present": value is not None}
+    encoded = json.dumps(fields, sort_keys=True, separators=(",", ":")).encode()
+    return {"sha256": hashlib.sha256(encoded).hexdigest(), "fields": fields}
+
+
+def semantic_sequence_fingerprints(inputs: Mapping[str, Any]) -> list[dict[str, Any]]:
+    tokens = inputs["input_ids"]
+    boundaries = inputs.get("cu_seqlens")
+    sequences = []
+    if boundaries is not None:
+        cuts = boundaries.detach().cpu().tolist()
+        for start, end in zip(cuts[:-1], cuts[1:], strict=True):
+            sequence = {
+                key: value[start:end]
+                for key, value in inputs.items()
+                if key != "cu_seqlens"
+                and torch.is_tensor(value)
+                and value.ndim > 0
+                and value.shape[0] == tokens.shape[0]
+            }
+            sequences.append({"length": end - start, **input_fingerprint(sequence)})
+    else:
+        mask = inputs["attention_mask"].bool()
+        for row in range(tokens.shape[0]):
+            sequence = {
+                key: value[row][mask[row]]
+                for key, value in inputs.items()
+                if torch.is_tensor(value)
+                and value.ndim >= 2
+                and value.shape[:2] == tokens.shape[:2]
+            }
+            sequences.append(
+                {"length": int(mask[row].sum()), **input_fingerprint(sequence)}
+            )
+    return sequences
+
+
+def execution_trace_checks(
+    reference: dict[str, Any], observed: dict[str, Any]
+) -> dict[str, Any]:
+    checks: dict[str, Any] = {}
+    for phase, forward_only in (("forward", True), ("backward", False)):
+        left = [
+            entry
+            for entry in reference["microbatches"]
+            if entry["forward_only"] == forward_only and not entry["transport_dummy"]
+        ]
+        right = [
+            entry
+            for entry in observed["microbatches"]
+            if entry["forward_only"] == forward_only and not entry["transport_dummy"]
+        ]
+        left_semantic = [
+            sequence["sha256"]
+            for entry in left
+            for sequence in entry["semantic_sequences"]
+        ]
+        right_semantic = [
+            sequence["sha256"]
+            for entry in right
+            for sequence in entry["semantic_sequences"]
+        ]
+        checks[phase] = {
+            "reference_real_microbatches": len(left),
+            "observed_real_microbatches": len(right),
+            "semantic_sequence_order_match": left_semantic == right_semantic,
+            "source_padded_input_order_match": [
+                entry["source_padded_input"]["sha256"] for entry in left
+            ]
+            == [entry["source_padded_input"]["sha256"] for entry in right],
+            "original_input_order_match": [
+                entry["original_input"]["sha256"] for entry in left
+            ]
+            == [entry["original_input"]["sha256"] for entry in right],
+        }
+    left_loss = [
+        entry for entry in reference["loss_inputs"] if not entry["transport_dummy"]
+    ]
+    right_loss = [
+        entry for entry in observed["loss_inputs"] if not entry["transport_dummy"]
+    ]
+    checks["loss_inputs"] = {
+        "exact_input_order_match": [
+            entry["fingerprint"]["sha256"] for entry in left_loss
+        ]
+        == [entry["fingerprint"]["sha256"] for entry in right_loss],
+        "semantic_sequence_order_match": [
+            sequence["sha256"]
+            for entry in left_loss
+            for sequence in entry["semantic_sequences"]
+        ]
+        == [
+            sequence["sha256"]
+            for entry in right_loss
+            for sequence in entry["semantic_sequences"]
+        ],
+    }
+    checks["isolation_pass"] = (
+        all(
+            checks[phase]["semantic_sequence_order_match"]
+            and checks[phase]["source_padded_input_order_match"]
+            for phase in ("forward", "backward")
+        )
+        and checks["loss_inputs"]["semantic_sequence_order_match"]
+    )
+    return checks
+
+
 class UpdateProbe(MegatronPPOActor):
     """Observe real post-reduction, pre-clipping gradients at the step boundary."""
+
+    def reset_execution_trace(self, label: str) -> None:
+        self.execution_trace = {
+            "label": label,
+            "microbatches": [],
+            "loss_inputs": [],
+            "schedule_calls": 0,
+        }
+
+    def forward_backward_batch(
+        self, mb_list, process_output_fn, forward_only=False, gather_cp_output=False
+    ):
+        if hasattr(self, "execution_trace"):
+            call_id = self.execution_trace["schedule_calls"]
+            self.execution_trace["schedule_calls"] += 1
+            for microbatch_index, microbatch in enumerate(mb_list):
+                self.execution_trace["microbatches"].append(
+                    {
+                        "schedule_call": call_id,
+                        "microbatch_index": microbatch_index,
+                        "forward_only": forward_only,
+                        "transport_dummy": microbatch.orig_mb.get(TRANSPORT_DUMMY_KEY)
+                        is True,
+                        "padding_length": microbatch.padding_length,
+                        "padded_to_length": microbatch.padded_to_length,
+                        "original_input": input_fingerprint(microbatch.orig_mb),
+                        "source_padded_input": input_fingerprint(microbatch.padded_mb),
+                        "semantic_sequences": semantic_sequence_fingerprints(
+                            microbatch.orig_mb
+                        ),
+                        "calculate_per_token_loss": bool(
+                            get_model_config(self.model[0]).calculate_per_token_loss
+                        ),
+                    }
+                )
+        return super().forward_backward_batch(
+            mb_list, process_output_fn, forward_only, gather_cp_output
+        )
+
+    def _compute_logprobs_and_loss(
+        self,
+        output,
+        inputs,
+        loss_fn,
+        loss_weight_fn,
+        total_loss_weight,
+        loss_multiplier=1.0,
+        per_token_loss=False,
+        total_token_count=None,
+    ):
+        if hasattr(self, "execution_trace"):
+            self.execution_trace["loss_inputs"].append(
+                {
+                    "transport_dummy": inputs.get(TRANSPORT_DUMMY_KEY) is True,
+                    "fingerprint": input_fingerprint(inputs),
+                    "semantic_sequences": semantic_sequence_fingerprints(inputs),
+                    "per_token_loss": per_token_loss,
+                    "original_denominator": _scalar_value(total_loss_weight),
+                    "original_multiplier": _scalar_value(loss_multiplier),
+                }
+            )
+        if getattr(self, "_serial_numerator_active", False):
+            if self._stream_replica_active or per_token_loss:
+                raise AssertionError(
+                    "Independent serial numerator reference requires legacy serial loss"
+                )
+            if not torch.is_tensor(total_loss_weight) or total_loss_weight.ndim != 0:
+                raise AssertionError(
+                    "Serial numerator reference requires one scalar normalizer"
+                )
+            mass = float(total_loss_weight.item())
+            if not math.isfinite(mass) or mass <= 0:
+                raise AssertionError(
+                    "Serial numerator reference requires positive global token mass"
+                )
+            if self._serial_numerator_mass is None:
+                self._serial_numerator_mass = mass
+            elif self._serial_numerator_mass != mass:
+                raise AssertionError(
+                    "Global token mass changed between serial microbatches"
+                )
+            self._serial_numerator_callbacks += 1
+            # Super train_batch supplies DP*Nmb. Retain only Nmb to cancel
+            # MCore's /Nmb, with a unit denominator: backward sees raw numerators.
+            total_loss_weight = torch.ones_like(total_loss_weight)
+            loss_multiplier = loss_multiplier / self.data_parallel_world_size
+        if hasattr(self, "execution_trace"):
+            self.execution_trace["loss_inputs"][-1].update(
+                effective_denominator=_scalar_value(total_loss_weight),
+                effective_multiplier=_scalar_value(loss_multiplier),
+            )
+        return super()._compute_logprobs_and_loss(
+            output,
+            inputs,
+            loss_fn,
+            loss_weight_fn,
+            total_loss_weight,
+            loss_multiplier=loss_multiplier,
+            per_token_loss=per_token_loss,
+            total_token_count=total_token_count,
+        )
+
+    def _finalize_model_grads(self, *args, **kwargs) -> None:
+        if getattr(self, "_serial_numerator_active", False):
+            if (
+                self._stream_replica_active
+                or get_model_config(self.model[0]).calculate_per_token_loss
+            ):
+                raise AssertionError(
+                    "Serial numerator reference cannot use streamed/native normalization"
+                )
+            if (
+                self._serial_numerator_finalizations
+                or self._serial_numerator_mass is None
+            ):
+                raise AssertionError(
+                    "Expected exactly one finalize after serial loss callbacks"
+                )
+            token_count = args[1] if len(args) > 1 else kwargs.get("num_tokens")
+            if token_count is not None:
+                raise AssertionError(
+                    "Legacy serial numerator reference must not normalize twice"
+                )
+            scale = self.data_parallel_world_size / self._serial_numerator_mass
+            for chunk in self.model:
+                chunk.scale_gradients(scale)
+            self._serial_numerator_finalizations += 1
+            self.serial_normalization = {
+                "global_token_mass": self._serial_numerator_mass,
+                "fp32_pre_finalize_scale": scale,
+                "finalizations": self._serial_numerator_finalizations,
+                "loss_callbacks": self._serial_numerator_callbacks,
+            }
+        return super()._finalize_model_grads(*args, **kwargs)
 
     def distributed_optimizers(self) -> list[DistributedOptimizer]:
         optimizers = list(iter_megatron_optimizer_leaves(self.optimizer))
@@ -286,14 +627,45 @@ class UpdateProbe(MegatronPPOActor):
         self.lr_scheduler.load_state_dict(copy.deepcopy(state["scheduler"]))
         self.optimizer_zero_grad()
 
-    def serial_update(self, raw: list[dict[str, Any]]) -> None:
-        data = copy.deepcopy(raw)
-        logps = self.compute_logp(data)
-        if logps is None:
-            raise AssertionError("PP=1 must return logprobs")
-        for trajectory, logp in zip(data, logps, strict=True):
-            trajectory["prox_logp"] = logp.detach().cpu()
-        self.ppo_update(self.compute_advantages(data))
+    def serial_update(
+        self, raw: list[dict[str, Any]], *, numerator_reference: bool = False
+    ) -> None:
+        if (
+            numerator_reference
+            and get_model_config(self.model[0]).calculate_per_token_loss
+        ):
+            raise AssertionError(
+                "--serial-numerator-reference supports legacy per-token-loss=False only"
+            )
+        if self._stream_replica_active or getattr(
+            self, "_serial_numerator_active", False
+        ):
+            raise AssertionError(
+                "Serial reference must run independently of Stream Trainer"
+            )
+        self._serial_numerator_mass = None
+        self._serial_numerator_finalizations = 0
+        self._serial_numerator_callbacks = 0
+        self._serial_numerator_active = numerator_reference
+        try:
+            data = copy.deepcopy(raw)
+            logps = self.compute_logp(data)
+            if logps is None:
+                raise AssertionError("PP=1 must return logprobs")
+            for trajectory, logp in zip(data, logps, strict=True):
+                trajectory["prox_logp"] = logp.detach().cpu()
+            # Always use the ordinary PPO train_batch and DP schedule. Reference
+            # B changes only the two test-subclass loss/finalize hooks above.
+            self.ppo_update(self.compute_advantages(data))
+            if numerator_reference and (
+                self._serial_numerator_finalizations != 1
+                or self._serial_numerator_callbacks < 1
+            ):
+                raise AssertionError(
+                    "Serial numerator reference did not execute one complete update"
+                )
+        finally:
+            self._serial_numerator_active = False
 
     def assert_same(self, left: Any, right: Any, rtol: float, atol: float) -> None:
         if isinstance(left, torch.Tensor):
@@ -341,6 +713,11 @@ def main() -> None:
         "--power-of-two-mass",
         action="store_true",
         help="DP2-only normalization-rounding control: mass128, local masses80/48",
+    )
+    parser.add_argument(
+        "--serial-numerator-reference",
+        action="store_true",
+        help="Reference B: original serial train_batch with raw-numerator backward and FP32 final normalization",
     )
     args = parser.parse_args()
     world = int(os.environ["WORLD_SIZE"])
@@ -408,7 +785,15 @@ def main() -> None:
     actor.serial_update(raw)  # Populate Adam moments before either compared update.
     initial = actor.snapshot()
     actor.assert_parameter_state_complete(initial)
-    actor.serial_update(raw)
+    reference_mode = (
+        "B_serial_numerator" if args.serial_numerator_reference else "A_original_serial"
+    )
+    actor.reset_execution_trace(reference_mode)
+    actor.serial_update(raw, numerator_reference=args.serial_numerator_reference)
+    reference_trace = copy.deepcopy(actor.execution_trace)
+    reference_normalization = copy.deepcopy(
+        getattr(actor, "serial_normalization", None)
+    )
     reference = actor.snapshot()
     actor.assert_parameter_state_complete(reference)
     for initial_parameters, reference_parameters in zip(
@@ -427,6 +812,7 @@ def main() -> None:
     actor.restore(initial)
     actor.assert_same(initial, actor.snapshot(), 0, 0)
     dist.barrier()
+    actor.reset_execution_trace("C_stream")
     started = time.monotonic()
     if rank == dp - 1:
         time.sleep(args.delay_seconds)
@@ -446,17 +832,27 @@ def main() -> None:
         if args.power_of_two_mass
         else "fixed-shape-default-mass"
     )
+    if args.serial_numerator_reference:
+        fixture += "-serial-numerator-reference"
+    observed_trace = copy.deepcopy(actor.execution_trace)
+    trace_checks = execution_trace_checks(reference_trace, observed_trace)
     diagnostics_path = output / f"diagnostics-rank-{dist.get_rank()}.json"
     diagnostics: dict[str, Any] = {
         "rank": dist.get_rank(),
         "dp_rank": rank,
         "fixture": fixture,
+        "reference_mode": reference_mode,
+        "reference_normalization": reference_normalization,
+        "reference_execution_trace": reference_trace,
+        "stream_execution_trace": observed_trace,
+        "trace_checks": trace_checks,
         "actual_local_token_mass": local_token_mass,
         "actual_global_token_mass": global_token_mass,
         "rtol": args.rtol,
         "atol": args.atol,
         "status": "collecting",
-        "comparison_direction": "reference=serial; observed=stream",
+        "comparison_direction": f"reference={reference_mode}; observed=C_stream",
+        "original_A_pass_claimed": False if args.serial_numerator_reference else None,
         "sum_scope": "sum gradient aggregate.sums across ranks; TP-replicated optimizer entries remain counted per rank",
         "replica_topology": replica_topology,
         "comparisons": {},
@@ -473,6 +869,15 @@ def main() -> None:
             reference[category], observed_state[category], args.rtol, args.atol
         )
         write_report(diagnostics_path, diagnostics)
+    diagnostics["master_update_delta"] = master_delta_diagnostics(
+        actor,
+        initial["optimizer_parameters"],
+        reference["optimizer_parameters"],
+        observed_state["optimizer_parameters"],
+        args.rtol,
+        args.atol,
+    )
+    write_report(diagnostics_path, diagnostics)
     overlap_pass = rank == dp - 1 or backward_done < args.delay_seconds
     mass_pass = not args.power_of_two_mass or (
         global_token_mass == 128 and local_token_mass == (80 if rank == 0 else 48)
@@ -483,6 +888,7 @@ def main() -> None:
     local_failed = not (
         overlap_pass
         and mass_pass
+        and (not args.serial_numerator_reference or trace_checks["isolation_pass"])
         and all(report["strict_pass"] for report in diagnostics["comparisons"].values())
     )
     diagnostics["local_status"] = "failed" if local_failed else "passed"
@@ -502,6 +908,9 @@ def main() -> None:
         "dp_rank": rank,
         "status": diagnostics["status"],
         "fixture": fixture,
+        "reference_mode": reference_mode,
+        "trace_isolation_pass": trace_checks["isolation_pass"],
+        "original_A_pass_claimed": False if args.serial_numerator_reference else None,
         "actual_local_token_mass": local_token_mass,
         "actual_global_token_mass": global_token_mass,
         "backward_done_s": backward_done,
