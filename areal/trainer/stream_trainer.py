@@ -175,6 +175,9 @@ class StreamTrainer:
         try:
             self.rollout.begin_stream_collection()
             collection_started = True
+            # The dispatcher may already hold prefetched inputs from the last
+            # step. Observe their worker reservations before admitting them.
+            self.rollout.resume()
             future = collection_pool.submit(collect)
             while not future.done():
                 consume_events(self.config.poll_interval)

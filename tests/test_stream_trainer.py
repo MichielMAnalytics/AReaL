@@ -71,6 +71,7 @@ class _Rollout:
         self.pauses = 0
         self.restores = 0
         self.final_drains = 0
+        self.resumes = 0
 
     def stream_topology(self):
         return [
@@ -108,6 +109,10 @@ class _Rollout:
 
     def pause(self):
         self.pauses += 1
+
+    def resume(self):
+        assert self.collecting, "Observe reservations before admitting prefetched work"
+        self.resumes += 1
 
     def end_stream_collection(self):
         self.collecting = False
@@ -255,3 +260,19 @@ def test_stream_topology_nonhead_rpc_none_preserves_complete_tp_mapping():
     trainer._discover_replicas()
 
     assert trainer._replicas == {0: (1, [2, 3]), 1: (0, [0, 1])}
+
+
+def test_stream_trainer_consecutive_steps_observe_before_resuming_prefetch(monkeypatch):
+    trainer, actor, rollout, prepare, _, _ = _experiment(monkeypatch)
+
+    for step in range(2):
+        actor.collection_returned.clear()
+        actor.first_backward.clear()
+        rollout.finished_workers.clear()
+        trainer.collect_and_accumulate(prepare, global_step=step)
+        trainer.commit()
+        trainer.release_rollout()
+
+    assert rollout.resumes == 2
+    assert actor.commits == ["step-0-v7", "step-1-v7"]
+    assert rollout.restores == 2

@@ -1376,7 +1376,10 @@ class PPOTrainer:
             if not self._is_final_train_step(
                 global_step=global_step, max_steps=max_steps
             ):
-                self.rollout.resume()
+                # Streaming must install its next collection observer before
+                # the dispatcher admits any prefetched workflows.
+                if stream_trainer is None:
+                    self.rollout.resume()
             else:
                 logger.info(
                     "Skipping rollout resume after final training step "
