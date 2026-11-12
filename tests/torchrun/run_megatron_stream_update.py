@@ -882,12 +882,18 @@ def main() -> None:
     mass_pass = not args.power_of_two_mass or (
         global_token_mass == 128 and local_token_mass == (80 if rank == 0 else 48)
     )
+    reference_mass_pass = not args.serial_numerator_reference or (
+        reference_normalization is not None
+        and reference_normalization["global_token_mass"] == global_token_mass
+    )
     diagnostics["overlap_pass"] = overlap_pass
     diagnostics["fixture_mass_pass"] = mass_pass
+    diagnostics["reference_token_mass_pass"] = reference_mass_pass
     diagnostics["backward_done_s"] = backward_done
     local_failed = not (
         overlap_pass
         and mass_pass
+        and reference_mass_pass
         and (not args.serial_numerator_reference or trace_checks["isolation_pass"])
         and all(report["strict_pass"] for report in diagnostics["comparisons"].values())
     )
@@ -910,6 +916,7 @@ def main() -> None:
         "fixture": fixture,
         "reference_mode": reference_mode,
         "trace_isolation_pass": trace_checks["isolation_pass"],
+        "reference_token_mass_pass": reference_mass_pass,
         "original_A_pass_claimed": False if args.serial_numerator_reference else None,
         "actual_local_token_mass": local_token_mass,
         "actual_global_token_mass": global_token_mass,
