@@ -147,7 +147,7 @@ class UpdateProbe(MegatronPPOActor):
         if logps is None:
             raise AssertionError("PP=1 must return logprobs")
         for trajectory, logp in zip(data, logps, strict=True):
-            trajectory["prox_logp"] = logp
+            trajectory["prox_logp"] = logp.detach().cpu()
         self.ppo_update(self.compute_advantages(data))
 
     def assert_same(self, left: Any, right: Any, rtol: float, atol: float) -> None:

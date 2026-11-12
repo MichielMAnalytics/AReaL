@@ -4843,7 +4843,9 @@ class MegatronPPOActor(MegatronEngine):
                             "PP=1 streamed actor did not return proximal logprobs"
                         )
                     for trajectory, logp in zip(data, logps, strict=True):
-                        trajectory["prox_logp"] = logp
+                        # Advantages consume CPU-staged rollout tensors, just
+                        # as they do after ordinary controller logprob RPCs.
+                        trajectory["prox_logp"] = logp.detach().cpu()
                 prepared = self.actor.compute_advantages(data)
                 batched, meta = concat_batch(prepared)
                 mass = int(batched["loss_mask"].count_nonzero().item())
