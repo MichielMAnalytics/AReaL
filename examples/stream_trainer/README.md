@@ -71,8 +71,11 @@ actual `MegatronPPOActor`, PPO objective and Megatron forward/backward schedule:
 It also requires a nonzero reference gradient and verifies that an early replica
 finishes backward before the artificial delay expires. Increase
 `STREAM_TEST_TAIL_SECONDS` if model startup/backward itself exceeds the default
-30-second window; do not remove the ordering assertion. It writes one
-`FILEROOT/minimal/rank-*.json` per global rank only after that rank passes.
+30-second window; do not remove the ordering assertion. At completion it writes one
+`FILEROOT/minimal/rank-*.json` per global rank with an explicit `passed` or `failed`
+status. A strict failure on any rank marks every final result failed and exits nonzero.
+It also exercises the real CPU mirror process group through `stream_topology()`,
+checking that each TP replica returns every rank's host and nonempty GPU UUID.
 
 The default numerical tolerances are `rtol=0.02, atol=2e-5`, accounting for BF16
 accumulation-order differences. They are configurable arguments to the shell script and
@@ -85,6 +88,47 @@ computation shape fixed while changing chunk counts and token masses. Repacking 
 sequences into different BF16 shapes can itself exceed the elementwise tolerance and
 requires a separate numerical-variance assessment. Passing this fixture does not
 validate arbitrary production repacking differences.
+
+The default fixture retains its original 8-token prompt masks and elementwise
+`rtol=0.02, atol=2e-5` checks. Earlier failed runs remain failed. Before the final
+assertion it writes `diagnostics-rank-*.json`, first with gradient diagnostics and then
+with updated-model, optimizer-metadata, FP32 master/moment and scheduler comparisons. A
+gradient mismatch does not skip the subsequent state comparisons. Each tensor and its
+rank-local aggregate report relative L2 error, cosine similarity, observed/reference
+norm ratio, the least-squares scale `a = dot(reference, observed) / ||reference||²`,
+residual `||observed - a*reference|| / ||observed||`, strict mismatch rate and maximum
+absolute difference. The original `torch.testing.assert_close` decision is recorded
+separately from those diagnostics; small aggregate errors never override a failed strict
+check.
+
+The `aggregate.sums` fields contain FP64 sufficient statistics: squared reference and
+observed norms, dot product, squared difference, element/mismatch counts and nonfinite
+counts. Sum the gradient fields across ranks before deriving global metrics; do not
+average rank-local relative errors or cosines. TP-replicated optimizer parameters remain
+counted once per rank in this diagnostic scope. Full optimizer parameter/moment states
+are compared only on their DP roots, while model states are compared on every rank.
+Nonfinite metric values are written as JSON `null` and cannot qualify a failed
+comparison as passed. Diagnostics have `status: collecting` until all comparisons and
+the global failure decision complete, so incomplete output is not a passing result.
+
+A separate **DP2-only normalization-rounding control** keeps the 32/40/48 sequence
+lengths and 48-token microbatch budget, but changes group 0/1/2 prompt-mask prefixes to
+16/16/24. This gives global valid-token mass 128 and local DP masses 80/48, rather than
+the default global mass 192. Invoke it with a distinct output directory:
+
+```bash
+FILEROOT='<separate normalization-control output directory>' \
+  bash examples/stream_trainer/run_minimal_gpu.sh --power-of-two-mass
+```
+
+The script labels this output `fixed-shape-power-of-two-mass` and records actual local
+and global token masses, checking the expected 80/48 and 128 explicitly. Default output
+is labeled `fixed-shape-default-mass`. The control makes the legacy backward loss scale
+`DP/global_mass = 1/64`, a binary power, to isolate BF16 rounding when normalization
+moves from before backward to after gradient accumulation. It does not loosen
+thresholds, enable a different model/DDP normalization path, or change the production
+engine. **A passing control does not establish that the default legacy fixture or
+arbitrary production packing/normalization passes numerical parity.**
 
 This minimal test uses Megatron's real **distributed Adam** optimizer. Its ordinary
 `state_dict()` contains metadata but omits the sharded master parameters and moments;
