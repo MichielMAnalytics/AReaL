@@ -13,7 +13,6 @@ from collections.abc import Callable
 from concurrent.futures import Future
 from datetime import datetime
 from logging import Logger
-from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -1898,65 +1897,18 @@ class RemoteInfEngine(InferenceEngine):
             raise
 
     def get_stream_topology(self) -> dict[str, Any]:
-        """Identify GPUs held by the live local server process tree via NVML CLI.
-
-        Inspecting compute process UUIDs avoids assuming that CUDA ordinals match
-        host GPU indices, and creates no extra CUDA context on the RPC worker.
-        External servers are intentionally unsupported for partial colocation.
-        """
+        """Read GPU identities from the live local server's model processes."""
         if len(self.local_server_processes) != 1:
             raise ValueError(
                 "Stream colocation requires exactly one locally launched server"
             )
         info = self.local_server_processes[0]
-        process = info.process
-        if process is None or process.poll() is not None:
+        if info.process is None or info.process.poll() is not None:
             raise RuntimeError("Stream inference server is not running")
-        parents: dict[int, int] = {}
-        for directory in Path("/proc").iterdir():
-            if not directory.name.isdecimal():
-                continue
-            try:
-                # stat's comm field can contain spaces or parentheses.
-                status = (directory / "stat").read_text().rsplit(")", 1)[1].split()
-                parents[int(directory.name)] = int(status[1])
-            except (OSError, ValueError, IndexError):
-                continue
-        descendants = {process.pid}
-        while True:
-            found = {pid for pid, parent in parents.items() if parent in descendants}
-            if found <= descendants:
-                break
-            descendants.update(found)
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-compute-apps=pid,gpu_uuid",
-                "--format=csv,noheader,nounits",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        uuids = set()
-        for line in result.stdout.splitlines():
-            fields = [field.strip() for field in line.split(",")]
-            if (
-                len(fields) == 2
-                and fields[0].isdecimal()
-                and int(fields[0]) in descendants
-            ):
-                if not fields[1].startswith("GPU-"):
-                    raise ValueError(
-                        "Stream colocation requires physical NVIDIA GPU UUIDs"
-                    )
-                uuids.add(fields[1])
-        if not uuids:
-            raise RuntimeError(
-                "Cannot resolve live SGLang process GPU UUIDs from nvidia-smi"
-            )
-        return {"host": info.host, "gpu_uuids": sorted(uuids)}
+        reader = getattr(self.backend, "get_stream_topology", None)
+        if not callable(reader):
+            raise ValueError("Inference backend cannot report model GPU identities")
+        return {"host": info.host, "gpu_uuids": reader()}
 
     def _shutdown_one_server(self, server_info: LocalInfServerInfo):
         addr = format_hostport(server_info.host, server_info.port)

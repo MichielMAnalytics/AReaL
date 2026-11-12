@@ -208,27 +208,94 @@ def test_stream_topology_repeated_physical_gpu_rejects_overlap(controller):
         controller.stream_topology()
 
 
-def test_stream_topology_process_tree_excludes_unrelated_cuda_process(
-    monkeypatch, tmp_path
-):
-    """Use actual server descendants, not worker rank or visible-device indices."""
-    for pid, parent in ((10, 1), (11, 10), (12, 11), (99, 1)):
-        directory = tmp_path / str(pid)
-        directory.mkdir()
-        (directory / "stat").write_text(f"{pid} (name with spaces) S {parent} 0")
-    monkeypatch.setattr("areal.infra.remote_inf_engine.Path", lambda _: tmp_path)
-    run = Mock(
-        return_value=SimpleNamespace(
-            stdout=("11, GPU-first\n12, GPU-second\n99, GPU-unrelated\n")
-        )
-    )
-    monkeypatch.setattr("areal.infra.remote_inf_engine.subprocess.run", run)
+def test_stream_topology_reads_model_devices_instead_of_all_cuda_contexts():
+    """An unrelated parent CUDA context is not a model TP device."""
     engine = RemoteInfEngine.__new__(RemoteInfEngine)
     engine.local_server_processes = [
-        SimpleNamespace(host="host", process=SimpleNamespace(pid=10, poll=lambda: None))
+        SimpleNamespace(host="host", process=SimpleNamespace(poll=lambda: None))
     ]
+    engine.backend = SimpleNamespace(
+        get_stream_topology=Mock(return_value=["GPU-first", "GPU-second"])
+    )
 
     assert engine.get_stream_topology() == {
         "host": "host",
         "gpu_uuids": ["GPU-first", "GPU-second"],
     }
+    engine.backend.get_stream_topology.assert_called_once_with()
+
+
+@pytest.fixture
+def proc_start_time(monkeypatch):
+    from pathlib import Path
+
+    original = Path.read_text
+
+    def read(path, *args, **kwargs):
+        if str(path).startswith("/proc/"):
+            return "10 (scheduler name) " + " ".join(["0"] * 20)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    return "0"
+
+
+def test_stream_topology_model_records_require_complete_live_tp(
+    monkeypatch, tmp_path, proc_start_time
+):
+    import json
+
+    from areal.engine.sglang_remote import SGLangBackend
+
+    backend = SGLangBackend()
+    backend._stream_topology_dir = SimpleNamespace(name=str(tmp_path))
+    backend._stream_topology_size = 2
+    alive = Mock()
+    monkeypatch.setattr("areal.engine.sglang_remote.os.kill", alive)
+    for rank in range(2):
+        record = dict(
+            pid=10 + rank,
+            process_start_time=proc_start_time,
+            tp_rank=rank,
+            tp_size=2,
+            gpu_uuid=f"GPU-{rank}",
+        )
+        (tmp_path / f"{10 + rank}.json").write_text(json.dumps(record))
+    assert backend.get_stream_topology() == ["GPU-0", "GPU-1"]
+    assert alive.call_count == 2
+    (tmp_path / "11.json").unlink()
+    with pytest.raises(RuntimeError, match="Incomplete SGLang model topology"):
+        backend.get_stream_topology()
+
+
+def test_stream_topology_publisher_reads_explicit_model_device(
+    monkeypatch, tmp_path, proc_start_time
+):
+    import json
+
+    import torch
+
+    from areal.engine.awex.plugins.sglang_plugin import AwexSchedulerPlugin
+
+    scheduler = SimpleNamespace(
+        tp_rank=1,
+        tp_size=2,
+        tp_worker=SimpleNamespace(
+            model_runner=SimpleNamespace(
+                model=SimpleNamespace(
+                    parameters=lambda: iter(
+                        [SimpleNamespace(device=torch.device("cuda:3"))]
+                    )
+                )
+            )
+        ),
+    )
+    properties = Mock(return_value=SimpleNamespace(uuid="model-device-three"))
+    monkeypatch.setenv("AREAL_SGLANG_STREAM_TOPOLOGY_DIR", str(tmp_path))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", properties)
+    AwexSchedulerPlugin(scheduler)._publish_stream_topology()
+    properties.assert_called_once_with(torch.device("cuda:3"))
+    records = [json.loads(path.read_text()) for path in tmp_path.glob("*.json")]
+    assert len(records) == 1
+    assert records[0]["gpu_uuid"] == "model-device-three"
+    assert records[0]["tp_rank"] == 1

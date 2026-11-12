@@ -1717,6 +1717,9 @@ class PPOTrainer:
             if self._is_v1_awex_colocate(self.config):
                 server_args["awex_colocate_mode"] = True
                 server_args["awex_meta_server_addr"] = self._awex_meta_server_addr
+                server_args["_areal_stream_topology"] = (
+                    self.config.stream_trainer.enabled
+                )
                 # SGLang's release/resume endpoints are no-ops unless its
                 # torch-memory-saver regions were enabled at server startup.
                 # AWEX relies on those endpoints to hand the colocated GPU to

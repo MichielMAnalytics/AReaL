@@ -1330,7 +1330,9 @@ class RolloutController:
             uuids = record["gpu_uuids"]
             if len(uuids) != self._gpus_per_server or len(set(uuids)) != len(uuids):
                 raise ValueError(
-                    "SGLang topology does not match a whole rollout replica"
+                    "SGLang topology does not match a whole rollout replica: "
+                    f"worker={rank}, expected_gpus={self._gpus_per_server}, "
+                    f"record={record!r}"
                 )
             devices = {(record["host"], uuid) for uuid in uuids}
             if devices & occupied:
