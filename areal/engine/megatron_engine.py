@@ -2806,7 +2806,9 @@ class MegatronEngine(TrainEngine):
                     else mpu.get_tensor_model_parallel_world_size(),
                 )
             )
-            data.update(export_training_metrics(self))
+            data.update(
+                export_training_metrics(self, include_empty=bool(self._stream_terminal))
+            )
         if mpu.get_pipeline_model_parallel_world_size() > 1:
             # Some log info only exist in last pipeline rank
             data_list = [data]
