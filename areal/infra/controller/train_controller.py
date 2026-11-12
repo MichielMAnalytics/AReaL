@@ -793,11 +793,31 @@ class TrainController:
         results = self._stream_worker_call(
             "stream_topology", list(range(len(self.workers)))
         )
+        records = {}
         for rank, result in enumerate(results):
-            if not isinstance(result, dict) or result.get("rank") != rank:
+            if not self.workers_is_dp_head[rank]:
+                continue
+            if not isinstance(result, list):
                 raise RuntimeError(
                     f"Invalid streamed actor topology from worker {rank}"
                 )
+            for identity in result:
+                member = identity.get("rank") if isinstance(identity, dict) else None
+                if (
+                    not isinstance(member, int)
+                    or member < 0
+                    or member >= len(self.workers)
+                    or member in records
+                    or rank not in identity.get("replica_ranks", ())
+                ):
+                    raise RuntimeError(
+                        f"Invalid streamed actor topology from worker {rank}"
+                    )
+                records[member] = identity
+        if set(records) != set(range(len(self.workers))):
+            raise RuntimeError("Streamed actor topology does not cover every worker")
+        results = [records[rank] for rank in range(len(self.workers))]
+        for rank, result in enumerate(results):
             # Use the scheduler's address on both sides of physical-GPU matching.
             result["host"] = self.workers[rank].ip
         self._stream_replica_groups = {

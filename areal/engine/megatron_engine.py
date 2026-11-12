@@ -4778,8 +4778,8 @@ class MegatronPPOActor(MegatronEngine):
     def ppo_update(self, *args, **kwargs) -> None:
         self.actor.ppo_update(*args, **kwargs)
 
-    def stream_topology(self) -> dict[str, Any]:
-        """Expose actual rank/GPU identity; never infer colocation from rank order."""
+    def stream_topology(self) -> list[dict[str, Any]]:
+        """Gather actual TP identities for the RPC guard's DP-head-only return."""
         self._validate_stream_runtime()
         properties = torch.cuda.get_device_properties(torch.cuda.current_device())
         gpu_uuid = getattr(properties, "uuid", None)
@@ -4787,7 +4787,7 @@ class MegatronPPOActor(MegatronEngine):
             raise RuntimeError(
                 "CUDA device UUID is unavailable; refusing guessed GPU mapping"
             )
-        return dict(
+        identity = dict(
             rank=dist.get_rank(self.cpu_group),
             dp_rank=self.data_parallel_rank,
             replica_ranks=dist.get_process_group_ranks(
@@ -4796,6 +4796,12 @@ class MegatronPPOActor(MegatronEngine):
             host=socket.gethostname(),
             gpu_uuid=str(gpu_uuid),
         )
+        # Initialized training RPCs discard non-DP-head responses. Gather
+        # metadata on the existing CPU mirror, without onloading any GPU state.
+        group = self.cpu_model_parallel_group
+        identities = [None] * dist.get_world_size(group)
+        dist.all_gather_object(identities, identity, group=group)
+        return identities
 
     def stream_accumulate(
         self,

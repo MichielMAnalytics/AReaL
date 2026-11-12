@@ -86,17 +86,24 @@ def test_stream_topology_rpc_avoids_broadcast_and_uses_scheduler_hosts(controlle
 
     async def execute(worker_id, method, engine_name, *args, **kwargs):
         rank = int(worker_id.rsplit("-", 1)[1])
-        return {
-            "rank": rank,
-            "host": "untrusted-worker-name",
-            "replica_ranks": [0, 1] if rank < 2 else [2, 3],
-        }
+        if not controller.workers_is_dp_head[rank]:
+            return None  # The actual guard discards initialized non-head replies.
+        members = [0, 1] if rank < 2 else [2, 3]
+        return [
+            {
+                "rank": member,
+                "host": "untrusted-worker-name",
+                "replica_ranks": members,
+            }
+            for member in members
+        ]
 
     controller.scheduler.async_call_engine.side_effect = execute
 
     records = controller.stream_topology()
 
     assert [record["host"] for record in records] == ["node"] * 4
+    assert [record["rank"] for record in records] == list(range(4))
     for call in controller.scheduler.async_call_engine.call_args_list:
         assert call.kwargs["rpc_meta"] == {"broadcast": False}
         assert call.kwargs["max_retries"] == 1
