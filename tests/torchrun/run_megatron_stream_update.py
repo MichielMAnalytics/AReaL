@@ -211,7 +211,9 @@ def main() -> None:
         use_decoupled_loss=False,
         recompute_logprob=True,
         weight_update_mode="awex",
-        mb_spec=MicroBatchSpec(max_tokens_per_mb=128),
+        # Lengths 32/40/48 each occupy one real microbatch in both paths.
+        # Isolate accumulation from BF16 GEMM/GDN repacking differences.
+        mb_spec=MicroBatchSpec(max_tokens_per_mb=48),
         optimizer=OptimizerConfig(lr=1e-4, lr_scheduler_type="constant"),
         megatron=MegatronEngineConfig(
             bridge_type=args.bridge_type,

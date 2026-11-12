@@ -75,9 +75,16 @@ finishes backward before the artificial delay expires. Increase
 `FILEROOT/minimal/rank-*.json` per global rank only after that rank passes.
 
 The default numerical tolerances are `rtol=0.02, atol=2e-5`, accounting for BF16
-packing/accumulation-order differences. They are configurable arguments to the shell
-script and must be assessed against the chosen model's baseline numerical variance. This
-comparison does not establish bitwise equivalence or RL quality.
+accumulation-order differences. They are configurable arguments to the shell script and
+must be assessed against the chosen model's baseline numerical variance. This comparison
+does not establish bitwise equivalence or RL quality.
+
+The fixture uses a 48-token microbatch budget for sequences of length 32, 40 and 48.
+Each real microbatch therefore contains one sequence in both paths, keeping its GEMM/GDN
+computation shape fixed while changing chunk counts and token masses. Repacking multiple
+sequences into different BF16 shapes can itself exceed the elementwise tolerance and
+requires a separate numerical-variance assessment. Passing this fixture does not
+validate arbitrary production repacking differences.
 
 This minimal test uses Megatron's real **distributed Adam** optimizer. Its ordinary
 `state_dict()` contains metadata but omits the sharded master parameters and moments;
